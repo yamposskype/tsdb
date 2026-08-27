@@ -146,9 +146,13 @@ class Engine:
         logger.info("Checkpoint saved and WAL rotated (WAL size exceeded threshold)")
 
     # ------------------------------------------------------------------
-    # Expose underlying query engine for convenience
+    # Expose underlying components for convenience
     # ------------------------------------------------------------------
 
     @property
     def query_engine(self) -> QueryEngine:
         return self._query_engine
+
+    @property
+    def storage(self) -> Storage:
+        return self._storage

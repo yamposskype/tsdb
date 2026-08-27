@@ -13,8 +13,9 @@ from typing import Annotated
 from fastapi import FastAPI, HTTPException, Query
 
 from tsdb.engine import Engine
+from tsdb.index import LabelMatcher, parse_matchers
 from tsdb.ingest import IngestBatch, IngestPoint
-from tsdb.query import QueryEngine
+from tsdb.query import QueryEngine, query_by_matchers
 from tsdb.types import AggregationType
 
 # Module-level singletons, initialized in lifespan
@@ -32,7 +33,7 @@ async def lifespan(app: FastAPI):
     _engine.stop()
 
 
-app = FastAPI(title="tsdb", version="0.2.0", lifespan=lifespan)
+app = FastAPI(title="tsdb", version="0.3.0", lifespan=lifespan)
 
 
 def _get_engine() -> Engine:
@@ -57,6 +58,17 @@ def _parse_labels(raw: str) -> dict[str, str]:
     return parsed
 
 
+def _parse_match_param(match_exprs: list[str]) -> list[LabelMatcher]:
+    """Parse one or more ``match[]`` query parameter values into LabelMatchers."""
+    matchers: list[LabelMatcher] = []
+    for expr in match_exprs:
+        try:
+            matchers.extend(parse_matchers(expr))
+        except Exception as exc:
+            raise HTTPException(status_code=400, detail=f"invalid matcher {expr!r}: {exc}") from exc
+    return matchers
+
+
 # ---------------------------------------------------------------------------
 # Health / meta
 # ---------------------------------------------------------------------------
@@ -73,6 +85,50 @@ def list_metrics():
     keys = engine.list_metrics()
     return {
         "metrics": [
+            {"name": k.name, "labels": dict(k.labels)}
+            for k in keys
+        ]
+    }
+
+
+# ---------------------------------------------------------------------------
+# Label index endpoints
+# ---------------------------------------------------------------------------
+
+@app.get("/api/v1/labels")
+def get_label_names():
+    """Return all label names present in the index."""
+    engine = _get_engine()
+    names = engine.storage.all_label_names()
+    return {"labels": names}
+
+
+@app.get("/api/v1/label/{name}/values")
+def get_label_values(name: str):
+    """Return all values indexed for the given label name."""
+    engine = _get_engine()
+    values = engine.storage.all_label_values(name)
+    return {"label": name, "values": values}
+
+
+@app.get("/api/v1/series")
+def get_series(
+    match: Annotated[
+        list[str],
+        Query(alias="match[]", description="Repeatable label matcher, e.g. match[]={job=\"web\"}"),
+    ] = [],
+):
+    """Return all series matching the given label matchers.
+
+    Each ``match[]`` value is a Prometheus-style label selector such as
+    ``{job="web", env=~"prod.*"}``.  Multiple ``match[]`` params are ANDed
+    together.  When no matchers are given all indexed series are returned.
+    """
+    engine = _get_engine()
+    matchers = _parse_match_param(match)
+    keys = engine.storage.find_series(matchers)
+    return {
+        "series": [
             {"name": k.name, "labels": dict(k.labels)}
             for k in keys
         ]
@@ -147,15 +203,26 @@ def instant_query(
 
 @app.get("/api/v1/query_range")
 def query_range(
-    name: str,
-    start: float,
-    end: float,
+    name: Annotated[str | None, Query(description="Metric name (exact). Omit when using match[].")] = None,
+    start: float = 0.0,
+    end: float = 0.0,
     labels: Annotated[str, Query()] = "{}",
     step: Annotated[float | None, Query(description="Bucket width in seconds for downsampling")] = None,
     agg: Annotated[str, Query(description="Aggregation: mean|sum|min|max|count|last")] = "mean",
+    match: Annotated[
+        list[str],
+        Query(alias="match[]", description="Label matchers, e.g. match[]={job=\"web\"}"),
+    ] = [],
 ):
-    qe = _get_qe()
-    label_dict = _parse_labels(labels)
+    """Range query.
+
+    Two modes:
+    * Classic — supply ``name`` (and optionally ``labels`` JSON glob dict)
+    * Label-index — supply one or more ``match[]`` params instead of ``name``
+
+    When ``match[]`` is supplied it takes precedence over ``name``/``labels``.
+    """
+    engine = _get_engine()
 
     try:
         agg_type = AggregationType(agg.lower())
@@ -166,6 +233,27 @@ def query_range(
     if start >= end:
         raise HTTPException(status_code=400, detail="start must be less than end")
 
+    # --- Label-matcher mode ---
+    if match:
+        matchers = _parse_match_param(match)
+        results = query_by_matchers(engine.storage, matchers, start, end, step=step, agg=agg_type)
+        return {
+            "results": [
+                {
+                    "name": qr.key.name,
+                    "labels": dict(qr.key.labels),
+                    "samples": [{"timestamp": s.timestamp, "value": s.value} for s in qr.samples],
+                }
+                for qr in results
+            ]
+        }
+
+    # --- Classic name + label glob mode ---
+    if name is None:
+        raise HTTPException(status_code=400, detail="supply either 'name' or 'match[]' parameter")
+
+    qe = _get_qe()
+    label_dict = _parse_labels(labels)
     samples = qe.range_query(name, label_dict, start, end, step=step, agg=agg_type)
     return {
         "name": name,
