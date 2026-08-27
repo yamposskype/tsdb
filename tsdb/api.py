@@ -11,6 +11,7 @@ from contextlib import asynccontextmanager
 from typing import Annotated
 
 from fastapi import FastAPI, HTTPException, Query
+from pydantic import BaseModel
 
 from tsdb.engine import Engine
 from tsdb.index import LabelMatcher, parse_matchers
@@ -303,4 +304,63 @@ def query_range(
         "name": name,
         "labels": label_dict,
         "samples": [{"timestamp": s.timestamp, "value": s.value} for s in samples],
+    }
+
+
+# ---------------------------------------------------------------------------
+# QL query endpoint
+# ---------------------------------------------------------------------------
+
+class _QueryRangeRequest(BaseModel):
+    query: str
+    start: float = 0.0
+    end: float = 0.0
+    step: float = 60.0
+
+
+@app.post("/api/v1/query_range")
+def query_range_ql(body: _QueryRangeRequest):
+    """Evaluate a PromQL-inspired query string over a time range.
+
+    Body JSON::
+
+        {
+            "query": "rate(requests_total{job='api'}[5m])",
+            "start": 1700000000,
+            "end":   1700003600,
+            "step":  60
+        }
+
+    Returns a list of series, each with ``name``, ``labels``, and ``samples``.
+    """
+    from tsdb.ql.errors import QueryEvalError, QueryParseError
+    from tsdb.ql.evaluator import QueryEvaluator
+
+    engine = _get_engine()
+
+    if body.start >= body.end:
+        raise HTTPException(status_code=400, detail="start must be less than end")
+
+    evaluator = QueryEvaluator(engine)
+    try:
+        results = evaluator.evaluate(body.query, body.start, body.end, body.step)
+    except QueryParseError as exc:
+        raise HTTPException(status_code=400, detail=f"parse error: {exc}") from exc
+    except QueryEvalError as exc:
+        raise HTTPException(status_code=400, detail=f"eval error: {exc}") from exc
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=str(exc)) from exc
+
+    return {
+        "results": [
+            {
+                "name": qr.key.name,
+                "labels": dict(qr.key.labels),
+                "samples": [
+                    {"timestamp": s.timestamp, "value": s.value}
+                    for s in qr.samples
+                ],
+            }
+            for qr in results
+        ]
     }
