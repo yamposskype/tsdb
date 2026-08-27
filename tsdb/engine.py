@@ -17,8 +17,11 @@ import logging
 import time
 from pathlib import Path
 
+from tsdb.background import BackgroundWorker
 from tsdb.checkpoint import Checkpoint
+from tsdb.compaction import CompactionConfig, Compactor
 from tsdb.query import QueryEngine
+from tsdb.retention import DEFAULT_RETENTION, RetentionManager, RetentionPolicy
 from tsdb.storage import Storage
 from tsdb.types import MetricKey, QueryResult, Sample
 from tsdb.wal import WAL, WALEntry
@@ -29,12 +32,23 @@ logger = logging.getLogger(__name__)
 
 
 class Engine:
-    def __init__(self, data_dir: str | Path) -> None:
+    def __init__(
+        self,
+        data_dir: str | Path,
+        retention_policy: RetentionPolicy | None = None,
+        compaction_config: CompactionConfig | None = None,
+    ) -> None:
         self._data_dir = Path(data_dir)
         self._storage = Storage()
         self._wal = WAL(self._data_dir)
         self._checkpoint = Checkpoint(self._data_dir, self._storage)
         self._query_engine = QueryEngine(self._storage)
+
+        policy = retention_policy if retention_policy is not None else DEFAULT_RETENTION
+        config = compaction_config if compaction_config is not None else CompactionConfig()
+        self._retention_manager = RetentionManager(self._storage, policy)
+        self._compactor = Compactor(self._storage, config)
+        self._worker = BackgroundWorker()
 
     # ------------------------------------------------------------------
     # Lifecycle
@@ -68,8 +82,15 @@ class Engine:
         # Step 3: open WAL for new writes
         self._wal.open()
 
+        # Step 4: start background maintenance tasks
+        self._worker.register("retention", 3600, self._retention_manager.apply)
+        self._worker.register("compaction", 1800, self._compactor.compact_all)
+        self._worker.register("checkpoint", 60, self.checkpoint_if_needed)
+        self._worker.start()
+
     def stop(self) -> None:
         """Checkpoint current state and close the WAL cleanly."""
+        self._worker.stop()
         self._checkpoint.save()
         logger.info("Checkpoint saved on shutdown")
         self._wal.close()
@@ -146,6 +167,23 @@ class Engine:
         logger.info("Checkpoint saved and WAL rotated (WAL size exceeded threshold)")
 
     # ------------------------------------------------------------------
+    # Manual maintenance triggers
+    # ------------------------------------------------------------------
+
+    def compact_now(self) -> int:
+        """Run compaction immediately and return the number of chunks merged."""
+        return self._compactor.compact_all()
+
+    def apply_retention_now(self) -> dict:
+        """Apply the retention policy immediately and return eviction stats."""
+        self._retention_manager.apply()
+        return {
+            "samples_removed": self._retention_manager.samples_removed(),
+            "bytes_freed": self._retention_manager.bytes_freed_estimate(),
+            "series_removed": self._retention_manager.series_removed(),
+        }
+
+    # ------------------------------------------------------------------
     # Expose underlying components for convenience
     # ------------------------------------------------------------------
 
@@ -156,3 +194,11 @@ class Engine:
     @property
     def storage(self) -> Storage:
         return self._storage
+
+    @property
+    def retention_manager(self) -> RetentionManager:
+        return self._retention_manager
+
+    @property
+    def compactor(self) -> Compactor:
+        return self._compactor
