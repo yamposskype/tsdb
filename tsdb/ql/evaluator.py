@@ -1,0 +1,464 @@
+"""Query evaluator: walks the AST and retrieves / transforms data from the engine.
+
+Evaluation model
+----------------
+* A *selector* (MetricSelector) fetches all raw samples in [start, end] for
+  the matching series.
+* A *range query* (RangeQuery) is not evaluated on its own — it is consumed by
+  window functions (rate, avg_over_time, …) that slide a window over the raw
+  data at each output step.
+* Aggregation functions (sum, avg, min, max, count) collapse the series
+  dimension: they take the instant value of each matching series at every step
+  and combine them.
+* Binary operations work element-wise: series vs scalar, or two series matched
+  by their label fingerprint.
+
+Internal return type: ``list[QueryResult]`` for vector results, ``float`` for
+scalar results.  The public :meth:`QueryEvaluator.evaluate` always returns
+``list[QueryResult]``.
+"""
+
+from __future__ import annotations
+
+import math
+from typing import TYPE_CHECKING, Union
+
+from tsdb.ql.ast import (
+    BinaryOp,
+    FunctionCall,
+    LabelMatcher,
+    MetricSelector,
+    NumberLiteral,
+    RangeQuery,
+)
+from tsdb.ql.errors import QueryEvalError
+from tsdb.ql.parser import parse_query
+from tsdb.types import MetricKey, QueryResult, Sample
+
+if TYPE_CHECKING:
+    from tsdb.engine import Engine
+
+# Internal result type: a vector of series or a scalar number.
+_EvalResult = Union[list[QueryResult], float]
+
+# Default look-back window used when evaluating instant selectors (seconds).
+_INSTANT_LOOKBACK = 300.0
+
+
+class QueryEvaluator:
+    """Evaluates query strings against a running :class:`~tsdb.engine.Engine`.
+
+    Usage::
+
+        evaluator = QueryEvaluator(engine)
+        results   = evaluator.evaluate("rate(requests[5m])", start, end, step=60)
+    """
+
+    def __init__(self, engine: "Engine") -> None:
+        self._engine = engine
+
+    # ------------------------------------------------------------------
+    # Public interface
+    # ------------------------------------------------------------------
+
+    def evaluate(
+        self,
+        query_str: str,
+        start: float,
+        end: float,
+        step: float = 60.0,
+    ) -> list[QueryResult]:
+        """Parse *query_str* and evaluate it over the time range [start, end].
+
+        *step* is the interval between output timestamps in seconds.
+
+        Returns a list of :class:`~tsdb.types.QueryResult`, one per output series.
+        Raises :class:`~tsdb.ql.errors.QueryParseError` or
+        :class:`~tsdb.ql.errors.QueryEvalError` on failure.
+        """
+        ast = parse_query(query_str)
+        result = self._eval(ast, start, end, step)
+
+        if isinstance(result, float):
+            # Wrap a scalar in a synthetic single-series result.
+            key = MetricKey(name="scalar", labels=frozenset())
+            steps = _make_steps(start, end, step)
+            samples = [Sample(timestamp=t, value=result) for t in steps]
+            return [QueryResult(key=key, samples=samples)]
+
+        return result
+
+    # ------------------------------------------------------------------
+    # Dispatch
+    # ------------------------------------------------------------------
+
+    def _eval(self, node, start: float, end: float, step: float) -> _EvalResult:
+        if isinstance(node, MetricSelector):
+            return self._eval_selector(node, start, end, step)
+        if isinstance(node, RangeQuery):
+            return self._eval_range_query(node, start, end, step)
+        if isinstance(node, FunctionCall):
+            return self._eval_function(node, start, end, step)
+        if isinstance(node, BinaryOp):
+            return self._eval_binary_op(node, start, end, step)
+        if isinstance(node, NumberLiteral):
+            return node.value
+        raise QueryEvalError(f"Unknown AST node type: {type(node).__name__}")
+
+    # ------------------------------------------------------------------
+    # Selector
+    # ------------------------------------------------------------------
+
+    def _eval_selector(
+        self, node: MetricSelector, start: float, end: float, step: float
+    ) -> list[QueryResult]:
+        """Fetch all raw samples in [start, end] for the matching series."""
+        matchers = _build_index_matchers(node)
+        return self._engine.storage.query_by_matchers(matchers, start, end)
+
+    def _eval_range_query(
+        self, node: RangeQuery, start: float, end: float, step: float
+    ) -> list[QueryResult]:
+        """Fetch raw data for the extended range needed by window functions.
+
+        This is called when a RangeQuery appears outside a window function
+        (unusual but legal).  Window functions call this themselves with the
+        appropriate extended range.
+        """
+        fetch_start = start - node.range_duration - node.offset
+        fetch_end = end - node.offset
+        matchers = _build_index_matchers(node.selector)
+        return self._engine.storage.query_by_matchers(matchers, fetch_start, fetch_end)
+
+    # ------------------------------------------------------------------
+    # Functions
+    # ------------------------------------------------------------------
+
+    def _eval_function(
+        self, node: FunctionCall, start: float, end: float, step: float
+    ) -> _EvalResult:
+        fn = node.function
+        steps = _make_steps(start, end, step)
+
+        # Window / rate functions — require a RangeQuery argument.
+        window_fns = frozenset({
+            "rate", "irate", "delta", "increase",
+            "avg_over_time", "min_over_time", "max_over_time", "sum_over_time",
+        })
+        if fn in window_fns:
+            return self._eval_window_function(fn, node, start, steps)
+
+        # Aggregation functions — collapse the series dimension.
+        agg_fns = frozenset({"sum", "avg", "min", "max", "count"})
+        if fn in agg_fns:
+            if not node.args:
+                raise QueryEvalError(f"Function '{fn}' requires at least one argument")
+            inner = self._eval(node.args[0], start, end, step)
+            if not isinstance(inner, list):
+                raise QueryEvalError(f"Function '{fn}' expects a series, got a scalar")
+            return self._aggregate_series(fn, inner, steps, node.by, node.without)
+
+        raise QueryEvalError(f"Unknown function: {fn!r}")
+
+    # --- Window functions (rate, avg_over_time, etc.) ------------------
+
+    def _eval_window_function(
+        self,
+        fn: str,
+        node: FunctionCall,
+        start: float,
+        steps: list[float],
+    ) -> list[QueryResult]:
+        if not node.args:
+            raise QueryEvalError(f"Function '{fn}' requires a range-selector argument")
+        arg = node.args[0]
+        if not isinstance(arg, RangeQuery):
+            raise QueryEvalError(
+                f"Function '{fn}' requires a range-selector like metric[5m], "
+                f"got {type(arg).__name__}"
+            )
+
+        duration = arg.range_duration
+        offset = arg.offset
+        end = steps[-1] if steps else start
+
+        # Fetch enough raw data to cover every window at every step.
+        fetch_start = steps[0] - duration - offset if steps else start - duration - offset
+        fetch_end = end - offset
+        matchers = _build_index_matchers(arg.selector)
+        raw_results = self._engine.storage.query_by_matchers(
+            matchers, fetch_start, fetch_end
+        )
+
+        output: list[QueryResult] = []
+        for qr in raw_results:
+            all_samples = sorted(qr.samples, key=lambda s: s.timestamp)
+            result_samples: list[Sample] = []
+
+            for t in steps:
+                window_start = t - duration - offset
+                window_end = t - offset
+                window = [
+                    s for s in all_samples
+                    if window_start <= s.timestamp <= window_end
+                ]
+                val = _apply_window_fn(fn, window, duration)
+                if val is not None:
+                    result_samples.append(Sample(timestamp=t, value=val))
+
+            output.append(QueryResult(key=qr.key, samples=result_samples))
+
+        return output
+
+    # --- Aggregation functions (sum, avg, min, max, count) -------------
+
+    def _aggregate_series(
+        self,
+        fn: str,
+        series_list: list[QueryResult],
+        steps: list[float],
+        by_labels: list[str] | None,
+        without_labels: list[str] | None,
+    ) -> list[QueryResult]:
+        """Aggregate across series at each step, grouping by label dimensions."""
+        # Group series by their aggregation key.
+        groups: dict[frozenset, list[QueryResult]] = {}
+        for qr in series_list:
+            labels = dict(qr.key.labels)
+            if by_labels is not None:
+                group_key = frozenset(
+                    (k, v) for k, v in labels.items() if k in by_labels
+                )
+            elif without_labels is not None:
+                group_key = frozenset(
+                    (k, v) for k, v in labels.items() if k not in without_labels
+                )
+            else:
+                group_key = frozenset()   # merge everything into one group
+            groups.setdefault(group_key, []).append(qr)
+
+        output: list[QueryResult] = []
+        for group_labels, group_series in groups.items():
+            result_samples: list[Sample] = []
+
+            for t in steps:
+                vals = []
+                for qr in group_series:
+                    v = _get_value_at(qr.samples, t)
+                    if v is not None:
+                        vals.append(v)
+                if vals:
+                    result_samples.append(
+                        Sample(timestamp=t, value=_apply_agg_fn(fn, vals))
+                    )
+
+            series_name = group_series[0].key.name if group_series else ""
+            key = MetricKey(name=series_name, labels=group_labels)
+            output.append(QueryResult(key=key, samples=result_samples))
+
+        return output
+
+    # ------------------------------------------------------------------
+    # Binary operations
+    # ------------------------------------------------------------------
+
+    def _eval_binary_op(
+        self, node: BinaryOp, start: float, end: float, step: float
+    ) -> _EvalResult:
+        left = self._eval(node.left, start, end, step)
+        right = self._eval(node.right, start, end, step)
+
+        # Scalar + Scalar
+        if isinstance(left, float) and isinstance(right, float):
+            return _scalar_op(node.op, left, right)
+
+        # Series op Scalar
+        if isinstance(left, list) and isinstance(right, float):
+            return _series_scalar_op(node.op, left, right, swapped=False)
+
+        # Scalar op Series (commutative cases: +, *, ==, !=)
+        if isinstance(left, float) and isinstance(right, list):
+            return _series_scalar_op(node.op, right, left, swapped=True)
+
+        # Series op Series — match by label fingerprint
+        if isinstance(left, list) and isinstance(right, list):
+            return _vector_op(node.op, left, right)
+
+        raise QueryEvalError("Unexpected operand types in binary expression")
+
+
+# ------------------------------------------------------------------
+# Pure helper functions (no engine dependency)
+# ------------------------------------------------------------------
+
+def _build_index_matchers(selector: MetricSelector):
+    """Convert an AST :class:`MetricSelector` into index LabelMatcher objects."""
+    from tsdb.index import LabelMatcher as IndexMatcher
+    matchers = []
+    if selector.name:
+        matchers.append(IndexMatcher(name="__name__", op="=", value=selector.name))
+    for m in selector.matchers:
+        matchers.append(IndexMatcher(name=m.name, op=m.op, value=m.value))
+    return matchers
+
+
+def _make_steps(start: float, end: float, step: float) -> list[float]:
+    """Return evenly-spaced evaluation timestamps in [start, end]."""
+    if step <= 0:
+        return [start] if start == end else [start, end]
+    steps: list[float] = []
+    n = 0
+    while True:
+        t = start + n * step
+        if t > end + 1e-9:
+            break
+        steps.append(t)
+        n += 1
+    return steps or [start]
+
+
+def _get_value_at(
+    samples: list[Sample], t: float, lookback: float = _INSTANT_LOOKBACK
+) -> float | None:
+    """Return the value of the most-recent sample at or before *t*.
+
+    Looks back up to *lookback* seconds.  Returns ``None`` when no sample
+    is found within the window.
+    """
+    relevant = [s for s in samples if t - lookback <= s.timestamp <= t]
+    if not relevant:
+        return None
+    return max(relevant, key=lambda s: s.timestamp).value
+
+
+def _apply_window_fn(fn: str, window: list[Sample], duration: float) -> float | None:
+    """Compute a window-function result over a list of samples."""
+    if not window:
+        return None
+
+    values = [s.value for s in window]
+
+    if fn == "rate":
+        if len(window) < 2:
+            return None
+        dt = window[-1].timestamp - window[0].timestamp
+        if dt <= 0:
+            return None
+        delta = window[-1].value - window[0].value
+        if delta < 0:
+            delta = window[-1].value   # counter reset: measure from 0
+        return delta / dt
+
+    if fn == "irate":
+        if len(window) < 2:
+            return None
+        last, prev = window[-1], window[-2]
+        dt = last.timestamp - prev.timestamp
+        if dt <= 0:
+            return None
+        delta = last.value - prev.value
+        if delta < 0:
+            delta = last.value
+        return delta / dt
+
+    if fn == "delta":
+        if len(window) < 2:
+            return None
+        return window[-1].value - window[0].value
+
+    if fn == "increase":
+        if len(window) < 2:
+            return None
+        delta = window[-1].value - window[0].value
+        if delta < 0:
+            delta = window[-1].value   # counter reset
+        return delta
+
+    if fn == "avg_over_time":
+        return sum(values) / len(values)
+
+    if fn == "min_over_time":
+        return min(values)
+
+    if fn == "max_over_time":
+        return max(values)
+
+    if fn == "sum_over_time":
+        return sum(values)
+
+    raise QueryEvalError(f"Unknown window function: {fn!r}")
+
+
+def _apply_agg_fn(fn: str, values: list[float]) -> float:
+    if fn == "sum":
+        return sum(values)
+    if fn == "avg":
+        return sum(values) / len(values)
+    if fn == "min":
+        return min(values)
+    if fn == "max":
+        return max(values)
+    if fn == "count":
+        return float(len(values))
+    raise QueryEvalError(f"Unknown aggregation function: {fn!r}")
+
+
+def _scalar_op(op: str, a: float, b: float) -> float:
+    if op == '+':   return a + b
+    if op == '-':   return a - b
+    if op == '*':   return a * b
+    if op == '/':   return a / b if b != 0.0 else math.nan
+    if op == '==':  return 1.0 if a == b else 0.0
+    if op == '!=':  return 1.0 if a != b else 0.0
+    if op == '>':   return 1.0 if a > b else 0.0
+    if op == '<':   return 1.0 if a < b else 0.0
+    if op == '>=':  return 1.0 if a >= b else 0.0
+    if op == '<=':  return 1.0 if a <= b else 0.0
+    raise QueryEvalError(f"Unknown binary operator: {op!r}")
+
+
+def _series_scalar_op(
+    op: str,
+    series: list[QueryResult],
+    scalar: float,
+    swapped: bool = False,
+) -> list[QueryResult]:
+    """Apply *op* between every sample in *series* and the constant *scalar*."""
+    result: list[QueryResult] = []
+    for qr in series:
+        new_samples: list[Sample] = []
+        for s in qr.samples:
+            a, b = (scalar, s.value) if swapped else (s.value, scalar)
+            val = _scalar_op(op, a, b)
+            new_samples.append(Sample(timestamp=s.timestamp, value=val))
+        result.append(QueryResult(key=qr.key, samples=new_samples))
+    return result
+
+
+def _vector_op(
+    op: str,
+    left: list[QueryResult],
+    right: list[QueryResult],
+) -> list[QueryResult]:
+    """Element-wise operation between two vectors, matched by label fingerprint."""
+    right_index: dict[frozenset, QueryResult] = {qr.key.labels: qr for qr in right}
+
+    result: list[QueryResult] = []
+    for lqr in left:
+        rqr = right_index.get(lqr.key.labels)
+        if rqr is None:
+            continue   # no matching series on right side; skip (one-to-one matching)
+
+        # Index right samples by timestamp for O(1) lookup.
+        right_by_ts: dict[float, float] = {s.timestamp: s.value for s in rqr.samples}
+
+        new_samples: list[Sample] = []
+        for s in lqr.samples:
+            rv = right_by_ts.get(s.timestamp)
+            if rv is not None:
+                val = _scalar_op(op, s.value, rv)
+                new_samples.append(Sample(timestamp=s.timestamp, value=val))
+
+        result.append(QueryResult(key=lqr.key, samples=new_samples))
+
+    return result
