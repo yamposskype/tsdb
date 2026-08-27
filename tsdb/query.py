@@ -1,9 +1,13 @@
 """Query engine: aggregations, downsampling, rate computation, and query helpers."""
 
 import math
+from typing import TYPE_CHECKING
 
-from tsdb.storage import Storage
-from tsdb.types import AggregationType, Sample
+from tsdb.types import AggregationType, QueryResult, Sample
+
+if TYPE_CHECKING:
+    from tsdb.index import LabelMatcher
+    from tsdb.storage import Storage
 
 
 def aggregate(samples: list[Sample], agg: AggregationType) -> float:
@@ -81,8 +85,31 @@ def rate(samples: list[Sample]) -> list[Sample]:
     return result
 
 
+def query_by_matchers(
+    storage: "Storage",
+    matchers: "list[LabelMatcher]",
+    start: float,
+    end: float,
+    step: float | None = None,
+    agg: AggregationType = AggregationType.MEAN,
+) -> list[QueryResult]:
+    """Find series matching *matchers* and query each over [start, end].
+
+    If *step* is given the samples for every matched series are downsampled
+    into fixed-width time buckets of width *step* using *agg*.
+    """
+    results = storage.query_by_matchers(matchers, start, end)
+    if step is not None:
+        downsampled: list[QueryResult] = []
+        for qr in results:
+            ds_samples = downsample(qr.samples, step, agg) if qr.samples else []
+            downsampled.append(QueryResult(key=qr.key, samples=ds_samples))
+        return downsampled
+    return results
+
+
 class QueryEngine:
-    def __init__(self, storage: Storage) -> None:
+    def __init__(self, storage: "Storage") -> None:
         self.storage = storage
 
     def range_query(
