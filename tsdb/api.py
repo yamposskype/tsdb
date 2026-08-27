@@ -166,6 +166,50 @@ def ingest_batch(batch: IngestBatch):
 
 
 # ---------------------------------------------------------------------------
+# Maintenance: compaction, retention, config
+# ---------------------------------------------------------------------------
+
+@app.post("/api/v1/compact", status_code=200)
+def compact():
+    """Trigger compaction immediately.  Returns the number of chunks merged."""
+    engine = _get_engine()
+    try:
+        merged = engine.compact_now()
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=str(exc)) from exc
+    return {"status": "ok", "chunks_merged": merged}
+
+
+@app.post("/api/v1/retention/apply", status_code=200)
+def retention_apply():
+    """Apply the retention policy immediately.  Returns eviction stats."""
+    engine = _get_engine()
+    try:
+        stats = engine.apply_retention_now()
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=str(exc)) from exc
+    return {"status": "ok", **stats}
+
+
+@app.get("/api/v1/config", status_code=200)
+def get_config():
+    """Return current retention policy and compaction configuration."""
+    engine = _get_engine()
+    policy = engine.retention_manager.policy
+    cfg = engine.compactor.config
+    return {
+        "retention": {
+            "name": policy.name,
+            "duration_seconds": policy.duration_seconds,
+        },
+        "compaction": {
+            "max_chunk_age_seconds": cfg.max_chunk_age_seconds,
+            "target_chunk_samples": cfg.target_chunk_samples,
+        },
+    }
+
+
+# ---------------------------------------------------------------------------
 # Checkpoint
 # ---------------------------------------------------------------------------
 
