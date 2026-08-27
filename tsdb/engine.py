@@ -17,6 +17,9 @@ import logging
 import time
 from pathlib import Path
 
+from tsdb.alerting.engine import AlertManager
+from tsdb.alerting.rule import AlertRule
+from tsdb.alerting.state import Alert, AlertState
 from tsdb.background import BackgroundWorker
 from tsdb.checkpoint import Checkpoint
 from tsdb.compaction import CompactionConfig, Compactor
@@ -49,6 +52,12 @@ class Engine:
         self._retention_manager = RetentionManager(self._storage, policy)
         self._compactor = Compactor(self._storage, config)
         self._worker = BackgroundWorker()
+
+        # Alerting — constructed after the query engine so the evaluator can
+        # reference the storage through it.
+        from tsdb.ql.evaluator import QueryEvaluator
+        self._alert_evaluator = QueryEvaluator(self)
+        self._alert_manager = AlertManager(self._alert_evaluator)
 
     # ------------------------------------------------------------------
     # Lifecycle
@@ -86,6 +95,7 @@ class Engine:
         self._worker.register("retention", 3600, self._retention_manager.apply)
         self._worker.register("compaction", 1800, self._compactor.compact_all)
         self._worker.register("checkpoint", 60, self.checkpoint_if_needed)
+        self._worker.register("alerting", 30, self._alert_manager.evaluate_all)
         self._worker.start()
 
     def stop(self) -> None:
@@ -184,6 +194,34 @@ class Engine:
         }
 
     # ------------------------------------------------------------------
+    # Alerting
+    # ------------------------------------------------------------------
+
+    def add_alert_rule(self, rule: AlertRule) -> None:
+        """Register an alert rule with the alerting engine."""
+        self._alert_manager.add_rule(rule)
+
+    def remove_alert_rule(self, name: str) -> None:
+        """Remove the alert rule identified by *name*."""
+        self._alert_manager.remove_rule(name)
+
+    def get_alerts(self, state: AlertState | None = None) -> list[Alert]:
+        """Return active alerts, optionally filtered by state."""
+        return self._alert_manager.get_alerts(state=state)
+
+    def get_firing_alerts(self) -> list[Alert]:
+        """Return only FIRING alerts."""
+        return self._alert_manager.get_firing()
+
+    def list_alert_rules(self) -> list[AlertRule]:
+        """Return all registered alert rules."""
+        return self._alert_manager.list_rules()
+
+    def evaluate_alerts_now(self) -> list[Alert]:
+        """Trigger an immediate alert evaluation cycle and return the results."""
+        return self._alert_manager.evaluate_all()
+
+    # ------------------------------------------------------------------
     # Expose underlying components for convenience
     # ------------------------------------------------------------------
 
@@ -202,3 +240,7 @@ class Engine:
     @property
     def compactor(self) -> Compactor:
         return self._compactor
+
+    @property
+    def alert_manager(self) -> AlertManager:
+        return self._alert_manager

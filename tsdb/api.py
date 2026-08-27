@@ -13,6 +13,8 @@ from typing import Annotated
 from fastapi import FastAPI, HTTPException, Query
 from pydantic import BaseModel
 
+from tsdb.alerting.loader import load_rules
+from tsdb.alerting.state import AlertState
 from tsdb.engine import Engine
 from tsdb.index import LabelMatcher, parse_matchers
 from tsdb.ingest import IngestBatch, IngestPoint
@@ -319,7 +321,7 @@ class _QueryRangeRequest(BaseModel):
 
 
 @app.post("/api/v1/query_range")
-def query_range_ql(body: _QueryRangeRequest):
+def query_range_ql(body: _QueryRangeRequest):  # type: ignore[misc]
     """Evaluate a PromQL-inspired query string over a time range.
 
     Body JSON::
@@ -364,3 +366,99 @@ def query_range_ql(body: _QueryRangeRequest):
             for qr in results
         ]
     }
+
+
+# ---------------------------------------------------------------------------
+# Alerting
+# ---------------------------------------------------------------------------
+
+def _alert_to_dict(alert) -> dict:
+    return {
+        "rule_name": alert.rule_name,
+        "labels": alert.labels,
+        "state": alert.state.value,
+        "value": alert.value,
+        "started_at": alert.started_at,
+        "fired_at": alert.fired_at,
+        "resolved_at": alert.resolved_at,
+    }
+
+
+@app.get("/api/v1/alerts")
+def list_alerts():
+    """Return all currently active alerts (PENDING, FIRING, or RESOLVED within grace period)."""
+    engine = _get_engine()
+    alerts = engine.get_alerts()
+    return {"alerts": [_alert_to_dict(a) for a in alerts]}
+
+
+@app.get("/api/v1/alerts/firing")
+def list_firing_alerts():
+    """Return only FIRING alerts."""
+    engine = _get_engine()
+    alerts = engine.get_firing_alerts()
+    return {"alerts": [_alert_to_dict(a) for a in alerts]}
+
+
+@app.post("/api/v1/rules", status_code=201)
+def create_rules(body: list[dict]):
+    """Load one or more alert rules.
+
+    Body is a JSON array of rule objects::
+
+        [
+            {
+                "name": "high_cpu",
+                "expr": "cpu_usage{job='api'}",
+                "condition": "gt",
+                "threshold": 90,
+                "for": "5m",
+                "severity": "warning",
+                "labels": {"team": "infra"},
+                "annotations": {"summary": "CPU above 90%"}
+            }
+        ]
+    """
+    engine = _get_engine()
+    try:
+        rules = load_rules(body)
+    except (ValueError, KeyError) as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+    for rule in rules:
+        engine.add_alert_rule(rule)
+
+    return {"status": "ok", "loaded": len(rules)}
+
+
+@app.get("/api/v1/rules")
+def list_rules():
+    """Return all registered alert rules."""
+    engine = _get_engine()
+    rules = engine.list_alert_rules()
+    return {
+        "rules": [
+            {
+                "name": r.name,
+                "expr": r.expr,
+                "condition": r.condition,
+                "threshold": r.threshold,
+                "for_duration": r.for_duration,
+                "severity": r.severity.value,
+                "labels": r.labels,
+                "annotations": r.annotations,
+            }
+            for r in rules
+        ]
+    }
+
+
+@app.delete("/api/v1/rules/{name}", status_code=200)
+def delete_rule(name: str):
+    """Remove the alert rule with the given name."""
+    engine = _get_engine()
+    rules_before = {r.name for r in engine.list_alert_rules()}
+    engine.remove_alert_rule(name)
+    if name not in rules_before:
+        raise HTTPException(status_code=404, detail=f"Rule {name!r} not found")
+    return {"status": "ok", "removed": name}
