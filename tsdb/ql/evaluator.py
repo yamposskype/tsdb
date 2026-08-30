@@ -143,6 +143,7 @@ class QueryEvaluator:
         # Window / rate functions — require a RangeQuery argument.
         window_fns = frozenset({
             "rate", "irate", "delta", "increase",
+            "changes", "resets",
             "avg_over_time", "min_over_time", "max_over_time", "sum_over_time",
         })
         if fn in window_fns:
@@ -373,6 +374,29 @@ def _apply_window_fn(fn: str, window: list[Sample], duration: float) -> float | 
         if delta < 0:
             delta = window[-1].value   # counter reset
         return delta
+
+    if fn == "changes":
+        # Count the number of times the value changed within the window.
+        # Consecutive duplicate values don't count.
+        if len(window) < 2:
+            return 0.0
+        count = 0
+        for i in range(1, len(window)):
+            if window[i].value != window[i - 1].value:
+                count += 1
+        return float(count)
+
+    if fn == "resets":
+        # Count counter resets — a reset is when the value drops (goes down).
+        # Useful for detecting process restarts on monotonic counters.
+        # TODO: might want to add a threshold here to filter out tiny floating-point noise
+        if len(window) < 2:
+            return 0.0
+        count = 0
+        for i in range(1, len(window)):
+            if window[i].value < window[i - 1].value:
+                count += 1
+        return float(count)
 
     if fn == "avg_over_time":
         return sum(values) / len(values)
