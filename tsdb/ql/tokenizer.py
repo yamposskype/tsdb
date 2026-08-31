@@ -56,6 +56,7 @@ _KEYWORDS: dict[str, TokenType] = {
 
 _KNOWN_FUNCTIONS: frozenset[str] = frozenset({
     "rate", "irate", "delta", "increase",
+    "changes", "resets",
     "sum", "avg", "min", "max", "count",
     "avg_over_time", "min_over_time", "max_over_time", "sum_over_time",
 })
