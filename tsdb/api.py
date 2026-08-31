@@ -18,6 +18,7 @@ from tsdb.alerting.state import AlertState
 from tsdb.engine import Engine
 from tsdb.index import LabelMatcher, parse_matchers
 from tsdb.ingest import IngestBatch, IngestPoint
+from tsdb.metadata import MetricMetadata, MetricType
 from tsdb.query import QueryEngine, query_by_matchers
 from tsdb.types import AggregationType
 
@@ -528,6 +529,83 @@ def load_recording_rules(body: dict):
         "groups_loaded": len(groups),
         "rules_loaded": sum(len(g.rules) for g in groups),
     }
+
+
+# ---------------------------------------------------------------------------
+# Metric metadata
+# ---------------------------------------------------------------------------
+
+class _MetadataBody(BaseModel):
+    metric: str
+    type: MetricType
+    help: str = ""
+    unit: str = ""
+
+
+@app.get("/api/v1/metadata")
+def list_metadata(
+    metric: Annotated[str | None, Query(description="Filter to a single metric name")] = None,
+):
+    """Return registered metric metadata.
+
+    Pass ``?metric=name`` to retrieve metadata for a single metric.  Without
+    the parameter, all entries are returned.
+    """
+    engine = _get_engine()
+    if metric is not None:
+        entry = engine.get_metadata(metric)
+        if entry is None:
+            raise HTTPException(status_code=404, detail=f"No metadata for {metric!r}")
+        return {
+            "metadata": [
+                {"metric": entry.metric, "type": entry.type, "help": entry.help, "unit": entry.unit}
+            ]
+        }
+    entries = engine.metadata_store.list()
+    return {
+        "metadata": [
+            {"metric": e.metric, "type": e.type, "help": e.help, "unit": e.unit}
+            for e in entries
+        ]
+    }
+
+
+@app.post("/api/v1/metadata", status_code=201)
+def set_metadata(body: _MetadataBody):
+    """Register or overwrite metadata for a metric.
+
+    Body JSON::
+
+        {
+            "metric": "http_request_duration_seconds",
+            "type": "histogram",
+            "help": "Duration of HTTP requests.",
+            "unit": "seconds"
+        }
+    """
+    engine = _get_engine()
+    m = MetricMetadata(
+        metric=body.metric,
+        type=body.type,
+        help=body.help,
+        unit=body.unit,
+    )
+    engine.set_metadata(m)
+    return {"status": "ok", "metric": body.metric}
+
+
+@app.delete("/api/v1/metadata/{metric}", status_code=200)
+def delete_metadata(metric: str):
+    """Remove the metadata entry for *metric*.
+
+    Returns 404 when no metadata was registered for that metric.
+    """
+    engine = _get_engine()
+    existing = engine.get_metadata(metric)
+    if existing is None:
+        raise HTTPException(status_code=404, detail=f"No metadata for {metric!r}")
+    engine.metadata_store.remove(metric)
+    return {"status": "ok", "removed": metric}
 
 
 @app.post("/api/v1/recording_rules/{group_name}/evaluate", status_code=200)
