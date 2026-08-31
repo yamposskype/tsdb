@@ -59,6 +59,7 @@ _KNOWN_FUNCTIONS: frozenset[str] = frozenset({
     "changes", "resets",
     "sum", "avg", "min", "max", "count",
     "avg_over_time", "min_over_time", "max_over_time", "sum_over_time",
+    "histogram_quantile", "histogram_count", "histogram_sum",
 })
 
 _DURATION_RE = re.compile(r'^(\d+(?:\.\d+)?)(ms|s|m|h|d|w)$')

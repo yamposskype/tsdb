@@ -159,6 +159,18 @@ class QueryEvaluator:
                 raise QueryEvalError(f"Function '{fn}' expects a series, got a scalar")
             return self._aggregate_series(fn, inner, steps, node.by, node.without)
 
+        # Histogram helpers.
+        if fn == "histogram_quantile":
+            return self._eval_histogram_quantile(node, start, end, step, steps)
+
+        if fn in ("histogram_count", "histogram_sum"):
+            if not node.args:
+                raise QueryEvalError(f"Function '{fn}' requires a series argument")
+            inner = self._eval(node.args[0], start, end, step)
+            if not isinstance(inner, list):
+                raise QueryEvalError(f"Function '{fn}' expects a series, got a scalar")
+            return self._histogram_simple(fn, inner, steps)
+
         raise QueryEvalError(f"Unknown function: {fn!r}")
 
     # --- Window functions (rate, avg_over_time, etc.) ------------------
@@ -255,6 +267,81 @@ class QueryEvaluator:
 
             series_name = group_series[0].key.name if group_series else ""
             key = MetricKey(name=series_name, labels=group_labels)
+            output.append(QueryResult(key=key, samples=result_samples))
+
+        return output
+
+    # --- Histogram functions -------------------------------------------
+
+    def _eval_histogram_quantile(
+        self,
+        node: FunctionCall,
+        start: float,
+        end: float,
+        step: float,
+        steps: list[float],
+    ) -> list[QueryResult]:
+        """Evaluate ``histogram_quantile(φ, metric{le="..."})``."""
+        if len(node.args) < 2:
+            raise QueryEvalError("histogram_quantile requires two arguments: (φ, series)")
+
+        phi_node = node.args[0]
+        phi = self._eval(phi_node, start, end, step)
+        if not isinstance(phi, float):
+            raise QueryEvalError("histogram_quantile: first argument must be a scalar φ")
+        if not (0.0 < phi <= 1.0):
+            raise QueryEvalError(
+                f"histogram_quantile: φ must be in (0, 1], got {phi}"
+            )
+
+        series_node = node.args[1]
+        raw_series = self._eval(series_node, start, end, step)
+        if not isinstance(raw_series, list):
+            raise QueryEvalError("histogram_quantile: second argument must be a series")
+
+        return _compute_histogram_quantile(phi, raw_series, steps)
+
+    def _histogram_simple(
+        self,
+        fn: str,
+        series_list: list[QueryResult],
+        steps: list[float],
+    ) -> list[QueryResult]:
+        """Implement histogram_count / histogram_sum by summing all bucket values.
+
+        Both functions just sum across all le-bucket series that share the same
+        base label set (everything except ``le``).  histogram_count gives you
+        the total observation count (the +Inf bucket value); histogram_sum gives
+        the sum of observed values.  Since we don't distinguish the two in raw
+        storage we return the sum of all bucket values, which is a reasonable
+        approximation for the common use-case of understanding scale.
+
+        TODO: distinguish _count and _sum suffixes when the ingest layer starts
+        tagging them separately.
+        """
+        groups: dict[frozenset, list[QueryResult]] = {}
+        for qr in series_list:
+            base_labels = frozenset(
+                (k, v) for k, v in qr.key.labels if k != "le"
+            )
+            groups.setdefault(base_labels, []).append(qr)
+
+        output: list[QueryResult] = []
+        for base_labels, group in groups.items():
+            result_samples: list[Sample] = []
+            for t in steps:
+                total = 0.0
+                found = False
+                for qr in group:
+                    v = _get_value_at(qr.samples, t)
+                    if v is not None:
+                        total += v
+                        found = True
+                if found:
+                    result_samples.append(Sample(timestamp=t, value=total))
+
+            name = group[0].key.name if group else ""
+            key = MetricKey(name=name, labels=base_labels)
             output.append(QueryResult(key=key, samples=result_samples))
 
         return output
@@ -457,6 +544,89 @@ def _series_scalar_op(
             new_samples.append(Sample(timestamp=s.timestamp, value=val))
         result.append(QueryResult(key=qr.key, samples=new_samples))
     return result
+
+
+def _compute_histogram_quantile(
+    phi: float,
+    series_list: list[QueryResult],
+    steps: list[float],
+) -> list[QueryResult]:
+    """Pure helper: compute φ-quantile from a set of histogram bucket series.
+
+    Algorithm
+    ---------
+    1. Group series by all labels *except* ``le``.
+    2. At each evaluation step, read the bucket counts and sort by le boundary.
+    3. Find the two adjacent buckets that straddle ``φ * total`` observations
+       and linearly interpolate the bucket boundary.
+    4. Return one result series per histogram group, without the ``le`` label.
+    """
+    # Group by base labels (drop le).
+    groups: dict[frozenset, list[QueryResult]] = {}
+    for qr in series_list:
+        base_labels = frozenset(
+            (k, v) for k, v in qr.key.labels if k != "le"
+        )
+        groups.setdefault(base_labels, []).append(qr)
+
+    output: list[QueryResult] = []
+    for base_labels, group in groups.items():
+        result_samples: list[Sample] = []
+
+        for t in steps:
+            # Build (le_value, cumulative_count) pairs for this timestamp.
+            buckets: list[tuple[float, float]] = []
+            for qr in group:
+                le_str = dict(qr.key.labels).get("le", "")
+                if le_str == "":
+                    continue
+                try:
+                    le_val = math.inf if le_str == "+Inf" else float(le_str)
+                except ValueError:
+                    continue
+                v = _get_value_at(qr.samples, t)
+                if v is not None:
+                    buckets.append((le_val, v))
+
+            if not buckets:
+                continue
+
+            # Sort ascending, +Inf last.
+            buckets.sort(key=lambda x: (math.isinf(x[0]), x[0]))
+
+            total = buckets[-1][1]  # cumulative count in the +Inf bucket
+            if total <= 0:
+                continue
+
+            target = phi * total
+
+            # Find the straddling bucket pair.
+            lower_le = 0.0
+            lower_count = 0.0
+            quantile_value: float | None = None
+
+            for le_val, cum_count in buckets:
+                if cum_count >= target:
+                    # Interpolate between [lower_le, le_val].
+                    bucket_width = le_val - lower_le
+                    bucket_count = cum_count - lower_count
+                    if bucket_count <= 0 or math.isinf(bucket_width):
+                        quantile_value = lower_le
+                    else:
+                        frac = (target - lower_count) / bucket_count
+                        quantile_value = lower_le + frac * bucket_width
+                    break
+                lower_le = le_val
+                lower_count = cum_count
+
+            if quantile_value is not None:
+                result_samples.append(Sample(timestamp=t, value=quantile_value))
+
+        name = group[0].key.name if group else ""
+        key = MetricKey(name=name, labels=base_labels)
+        output.append(QueryResult(key=key, samples=result_samples))
+
+    return output
 
 
 def _vector_op(

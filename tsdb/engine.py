@@ -23,6 +23,7 @@ from tsdb.alerting.state import Alert, AlertState
 from tsdb.background import BackgroundWorker
 from tsdb.checkpoint import Checkpoint
 from tsdb.compaction import CompactionConfig, Compactor
+from tsdb.metadata import MetadataStore, MetricMetadata
 from tsdb.query import QueryEngine
 from tsdb.recording import RecordingRuleGroup, RecordingRuleManager
 from tsdb.retention import DEFAULT_RETENTION, RetentionManager, RetentionPolicy
@@ -62,6 +63,9 @@ class Engine:
 
         # Recording rules — shares the same evaluator as alerting.
         self._recording_manager = RecordingRuleManager(self, self._alert_evaluator)
+
+        # Metric metadata (type, help, unit) — populated via set_metadata().
+        self.metadata_store = MetadataStore()
 
     # ------------------------------------------------------------------
     # Lifecycle
@@ -273,6 +277,18 @@ class Engine:
     def list_recording_groups(self) -> list[RecordingRuleGroup]:
         """Return all currently loaded recording rule groups."""
         return self._recording_manager.list_groups()
+
+    # ------------------------------------------------------------------
+    # Metadata
+    # ------------------------------------------------------------------
+
+    def set_metadata(self, m: MetricMetadata) -> None:
+        """Register or overwrite metadata for a metric."""
+        self.metadata_store.set(m)
+
+    def get_metadata(self, metric: str) -> MetricMetadata | None:
+        """Return metadata for *metric*, or None if not registered."""
+        return self.metadata_store.get(metric)
 
     # ------------------------------------------------------------------
     # Expose underlying components for convenience
