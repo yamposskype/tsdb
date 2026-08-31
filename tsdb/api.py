@@ -462,3 +462,90 @@ def delete_rule(name: str):
     if name not in rules_before:
         raise HTTPException(status_code=404, detail=f"Rule {name!r} not found")
     return {"status": "ok", "removed": name}
+
+
+# ---------------------------------------------------------------------------
+# Recording rules
+# ---------------------------------------------------------------------------
+
+def _recording_group_to_dict(group) -> dict:
+    return {
+        "name": group.name,
+        "interval": group.interval,
+        "rules": [
+            {
+                "record": r.name,
+                "expr": r.expr,
+                "interval": r.interval,
+                "labels": r.labels,
+            }
+            for r in group.rules
+        ],
+    }
+
+
+@app.get("/api/v1/recording_rules")
+def list_recording_rules():
+    """Return all loaded recording rule groups and their rules."""
+    engine = _get_engine()
+    groups = engine.list_recording_groups()
+    return {"groups": [_recording_group_to_dict(g) for g in groups]}
+
+
+@app.post("/api/v1/recording_rules", status_code=201)
+def load_recording_rules(body: dict):
+    """Load a recording rule group config.
+
+    Body JSON follows the Prometheus rule file format::
+
+        {
+            "groups": [
+                {
+                    "name": "aggregations",
+                    "interval": "1m",
+                    "rules": [
+                        {
+                            "record": "job:requests:rate5m",
+                            "expr": "rate(requests_total{job='api'}[5m])",
+                            "labels": {"env": "prod"}
+                        }
+                    ]
+                }
+            ]
+        }
+    """
+    engine = _get_engine()
+    try:
+        engine.load_recording_rules(body)
+    except (ValueError, KeyError) as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=str(exc)) from exc
+
+    groups = engine.list_recording_groups()
+    return {
+        "status": "ok",
+        "groups_loaded": len(groups),
+        "rules_loaded": sum(len(g.rules) for g in groups),
+    }
+
+
+@app.post("/api/v1/recording_rules/{group_name}/evaluate", status_code=200)
+def evaluate_recording_group(group_name: str):
+    """Force-evaluate a recording rule group immediately.
+
+    Useful for testing or for backfilling a newly added group without
+    waiting for its next scheduled evaluation.
+    """
+    engine = _get_engine()
+    try:
+        found = engine.evaluate_recording_group_now(group_name)
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=str(exc)) from exc
+
+    if not found:
+        raise HTTPException(
+            status_code=404,
+            detail=f"Recording rule group {group_name!r} not found",
+        )
+    return {"status": "ok", "group": group_name, "evaluated": True}

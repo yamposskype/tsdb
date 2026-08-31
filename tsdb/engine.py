@@ -24,6 +24,7 @@ from tsdb.background import BackgroundWorker
 from tsdb.checkpoint import Checkpoint
 from tsdb.compaction import CompactionConfig, Compactor
 from tsdb.query import QueryEngine
+from tsdb.recording import RecordingRuleGroup, RecordingRuleManager
 from tsdb.retention import DEFAULT_RETENTION, RetentionManager, RetentionPolicy
 from tsdb.storage import Storage
 from tsdb.types import MetricKey, QueryResult, Sample
@@ -58,6 +59,9 @@ class Engine:
         from tsdb.ql.evaluator import QueryEvaluator
         self._alert_evaluator = QueryEvaluator(self)
         self._alert_manager = AlertManager(self._alert_evaluator)
+
+        # Recording rules — shares the same evaluator as alerting.
+        self._recording_manager = RecordingRuleManager(self, self._alert_evaluator)
 
     # ------------------------------------------------------------------
     # Lifecycle
@@ -98,8 +102,12 @@ class Engine:
         self._worker.register("alerting", 30, self._alert_manager.evaluate_all)
         self._worker.start()
 
+        # Step 5: start recording rule evaluation threads (one per group).
+        self._recording_manager.start()
+
     def stop(self) -> None:
         """Checkpoint current state and close the WAL cleanly."""
+        self._recording_manager.stop()
         self._worker.stop()
         self._checkpoint.save()
         logger.info("Checkpoint saved on shutdown")
@@ -222,6 +230,51 @@ class Engine:
         return self._alert_manager.evaluate_all()
 
     # ------------------------------------------------------------------
+    # Recording rules
+    # ------------------------------------------------------------------
+
+    def load_recording_rules(self, config: dict) -> None:
+        """Parse *config* and load the resulting groups into the recording manager.
+
+        ``config`` follows the same shape as Prometheus rule files::
+
+            {
+                "groups": [
+                    {
+                        "name": "aggregations",
+                        "interval": "1m",
+                        "rules": [
+                            {
+                                "record": "job:requests:rate5m",
+                                "expr": "rate(requests_total[5m])",
+                                "labels": {}
+                            }
+                        ]
+                    }
+                ]
+            }
+        """
+        from tsdb.recording_loader import load_recording_rules_from_dict
+        groups = load_recording_rules_from_dict(config)
+        self._recording_manager.load_groups(groups)
+
+    def evaluate_recording_group_now(self, group_name: str) -> bool:
+        """Force-evaluate the named recording rule group immediately.
+
+        Returns True when the group was found and evaluated, False otherwise.
+        """
+        groups = self._recording_manager.list_groups()
+        for group in groups:
+            if group.name == group_name:
+                self._recording_manager.evaluate_group(group)
+                return True
+        return False
+
+    def list_recording_groups(self) -> list[RecordingRuleGroup]:
+        """Return all currently loaded recording rule groups."""
+        return self._recording_manager.list_groups()
+
+    # ------------------------------------------------------------------
     # Expose underlying components for convenience
     # ------------------------------------------------------------------
 
@@ -244,3 +297,7 @@ class Engine:
     @property
     def alert_manager(self) -> AlertManager:
         return self._alert_manager
+
+    @property
+    def recording_manager(self) -> RecordingRuleManager:
+        return self._recording_manager
